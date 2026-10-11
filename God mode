@@ -1,0 +1,441 @@
+--[[
+	GodMode.server.lua   (Script -> ServerScriptService)
+	Pairs with GodMenu.client.lua (LocalScript -> StarterPlayer > StarterPlayerScripts)
+
+	Per-player toggles, controlled from the in-game menu:
+	  God         infinite health, instant refill, can't die, invisible ForceField
+	  AntiFling   your character stops colliding with other players (collision groups);
+	              the menu script also cancels sudden speed / spin spikes
+	  TinyHitbox  shrinks your HumanoidRootPart (Roblox clamps part sizes to ~0.001 studs)
+	  NoTouch     body ignores Touched (kill bricks, touch-based projectiles)
+	  NoRaycast   body ignores raycasts (hitscan weapons)
+	  AntiVoid    teleports you back to safe ground instead of falling out of the map
+	  TouchFling  admin tool: players you touch are launched far away
+	  TouchKill   admin tool: players you touch die
+	The two touch tools are limited to the UserIds in AllowedUserIds (or anyone in Studio),
+	start OFF, and never affect the admins listed in AllowedUserIds.
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local PhysicsService = game:GetService("PhysicsService")
+local Debris = game:GetService("Debris")
+
+local CONFIG = {
+	-- UserIds allowed to use the menu (your number from roblox.com/users/NUMBER/profile)
+	AllowedUserIds = { 123456789 },
+	AllowAnyoneInStudio = true, -- lets you test in Studio without editing the list above
+	EveryoneGetsGodMode = false, -- true = every player in the server, ignores the list above
+
+	MaxHealth = math.huge,
+	TinyRootSize = Vector3.new(0.05, 0.05, 0.05),
+
+	-- Admin touch tools (toggled in the menu)
+	TouchRadius = 5, -- studs from your body that counts as "touching"
+	FlingSpeed = 600, -- horizontal launch speed
+	FlingLift = 250, -- upward launch speed
+	TouchCooldown = 1.5, -- seconds before the same player can be hit again
+}
+
+-- What allowed players start with each spawn/join. Set any to false to start with it off.
+local DEFAULTS = {
+	God = true,
+	AntiFling = true,
+	TinyHitbox = true,
+	NoTouch = true,
+	NoRaycast = true,
+	AntiVoid = true,
+	TouchFling = false, -- admin tools: off until you switch them on in the menu
+	TouchKill = false,
+}
+
+local BLOCKED_STATES = {
+	Enum.HumanoidStateType.Dead,
+	Enum.HumanoidStateType.FallingDown,
+	Enum.HumanoidStateType.Ragdoll,
+}
+
+local GROUP_NORMAL = "GM_Players" -- every player's character
+local GROUP_PROTECTED = "GM_AntiFling" -- characters with Anti-Fling on
+
+local remote = Instance.new("RemoteEvent")
+remote.Name = "GodModeToggle"
+remote.Parent = ReplicatedStorage
+
+for _, name in ipairs({ GROUP_NORMAL, GROUP_PROTECTED }) do
+	pcall(function()
+		PhysicsService:RegisterCollisionGroup(name)
+	end)
+end
+-- Protected characters pass through other players, but still collide with the world.
+PhysicsService:CollisionGroupSetCollidable(GROUP_PROTECTED, GROUP_NORMAL, false)
+PhysicsService:CollisionGroupSetCollidable(GROUP_PROTECTED, GROUP_PROTECTED, false)
+
+local states = {} -- [Player] = { settings, conns, forceField, lastSafe, ready, orig* }
+
+local function isAllowed(player)
+	if CONFIG.EveryoneGetsGodMode then
+		return true
+	end
+	if CONFIG.AllowAnyoneInStudio and RunService:IsStudio() then
+		return true
+	end
+	return table.find(CONFIG.AllowedUserIds, player.UserId) ~= nil
+end
+
+-- The touch tools are stricter than the rest: only real admins, never "everyone" mode
+local function canUseTouchTools(player)
+	if CONFIG.AllowAnyoneInStudio and RunService:IsStudio() then
+		return true
+	end
+	return table.find(CONFIG.AllowedUserIds, player.UserId) ~= nil
+end
+
+-- Connection bookkeeping, grouped per feature so each can be switched off on its own
+local function keep(st, key, conn)
+	local list = st.conns[key]
+	if not list then
+		list = {}
+		st.conns[key] = list
+	end
+	table.insert(list, conn)
+end
+
+local function drop(st, key)
+	local list = st.conns[key]
+	if list then
+		for _, conn in ipairs(list) do
+			conn:Disconnect()
+		end
+		st.conns[key] = nil
+	end
+end
+
+local function dropAll(st)
+	for key in pairs(st.conns) do
+		drop(st, key)
+	end
+end
+
+-- Collision groups (Anti-Fling)
+local function currentGroup(player)
+	local st = states[player]
+	if st and st.settings.AntiFling then
+		return GROUP_PROTECTED
+	end
+	return GROUP_NORMAL
+end
+
+local function applyGroup(player)
+	local character = player.Character
+	if not character then
+		return
+	end
+	local group = currentGroup(player)
+	for _, d in ipairs(character:GetDescendants()) do
+		if d:IsA("BasePart") then
+			d.CollisionGroup = group
+		end
+	end
+end
+
+-- God mode
+local function godOn(st, character, humanoid)
+	drop(st, "God")
+
+	humanoid.MaxHealth = CONFIG.MaxHealth
+	humanoid.Health = CONFIG.MaxHealth
+	humanoid.BreakJointsOnDeath = false
+	for _, state in ipairs(BLOCKED_STATES) do
+		humanoid:SetStateEnabled(state, false)
+	end
+
+	keep(
+		st,
+		"God",
+		humanoid.HealthChanged:Connect(function()
+			-- "~=" also catches NaN (inf - inf)
+			if humanoid.Health ~= humanoid.MaxHealth then
+				humanoid.Health = humanoid.MaxHealth
+			end
+		end)
+	)
+
+	local function addForceField()
+		local ff = Instance.new("ForceField")
+		ff.Visible = false
+		ff.Parent = character
+		st.forceField = ff
+	end
+	addForceField()
+	keep(
+		st,
+		"God",
+		character.ChildRemoved:Connect(function(child)
+			if child:IsA("ForceField") and character.Parent then
+				addForceField()
+			end
+		end)
+	)
+end
+
+local function godOff(st, humanoid)
+	drop(st, "God") -- first, so removing the ForceField below isn't undone
+	if st.forceField then
+		st.forceField:Destroy()
+		st.forceField = nil
+	end
+	humanoid.MaxHealth = st.origMaxHealth
+	humanoid.Health = humanoid.MaxHealth
+	humanoid.BreakJointsOnDeath = st.origBreakJoints
+	for _, state in ipairs(BLOCKED_STATES) do
+		humanoid:SetStateEnabled(state, true)
+	end
+end
+
+-- Hitbox ghosting (NoTouch / NoRaycast)
+local function ghostPart(st, part)
+	-- Parts inside your own tools are left alone so your weapons keep working
+	if not part:IsA("BasePart") or part:FindFirstAncestorOfClass("Tool") then
+		return
+	end
+	part.CanTouch = not st.settings.NoTouch
+	part.CanQuery = not st.settings.NoRaycast
+end
+
+local function refreshGhost(st, character)
+	for _, d in ipairs(character:GetDescendants()) do
+		ghostPart(st, d)
+	end
+	drop(st, "Ghost")
+	if st.settings.NoTouch or st.settings.NoRaycast then
+		keep(
+			st,
+			"Ghost",
+			character.DescendantAdded:Connect(function(d)
+				ghostPart(st, d)
+			end)
+		)
+	end
+end
+
+-- Anti-void
+local function voidOn(st, humanoid, root)
+	drop(st, "AntiVoid")
+	st.lastSafe = root.CFrame
+	keep(
+		st,
+		"AntiVoid",
+		RunService.Heartbeat:Connect(function()
+			if humanoid.FloorMaterial ~= Enum.Material.Air then
+				st.lastSafe = root.CFrame
+			elseif root.Position.Y < Workspace.FallenPartsDestroyHeight + 100 then
+				root.AssemblyLinearVelocity = Vector3.zero
+				root.CFrame = st.lastSafe + Vector3.new(0, 5, 0)
+			end
+		end)
+	)
+end
+
+-- fresh = true when a new character just spawned (nothing to undo yet)
+local function apply(player, key, fresh)
+	local st = states[player]
+	if not st then
+		return
+	end
+
+	if key == "AntiFling" then
+		applyGroup(player)
+		return
+	end
+
+	local character = player.Character
+	if not st.ready or not character then
+		return
+	end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if not humanoid or not root then
+		return
+	end
+
+	local on = st.settings[key]
+	if key == "God" then
+		if on then
+			godOn(st, character, humanoid)
+		elseif not fresh then
+			godOff(st, humanoid)
+		end
+	elseif key == "TinyHitbox" then
+		if on then
+			root.Size = CONFIG.TinyRootSize
+		elseif not fresh then
+			root.Size = st.origRootSize
+		end
+	elseif key == "NoTouch" or key == "NoRaycast" then
+		refreshGhost(st, character)
+	elseif key == "AntiVoid" then
+		drop(st, "AntiVoid")
+		if on then
+			voidOn(st, humanoid, root)
+		end
+	end
+end
+
+local function onCharacterAdded(player, character)
+	-- Every character goes into a collision group so protected players can pass through them
+	applyGroup(player)
+	character.DescendantAdded:Connect(function(d)
+		if d:IsA("BasePart") then
+			d.CollisionGroup = currentGroup(player)
+		end
+	end)
+
+	local st = states[player]
+	if not st then
+		return
+	end
+
+	local humanoid = character:WaitForChild("Humanoid", 10)
+	local root = character:WaitForChild("HumanoidRootPart", 10)
+	if not humanoid or not root or player.Character ~= character then
+		return
+	end
+
+	st.origMaxHealth = humanoid.MaxHealth
+	st.origBreakJoints = humanoid.BreakJointsOnDeath
+	st.origRootSize = root.Size
+	st.ready = true
+
+	for key in pairs(DEFAULTS) do
+		apply(player, key, true)
+	end
+end
+
+local function onPlayerAdded(player)
+	if isAllowed(player) then
+		local settings = table.clone(DEFAULTS)
+		states[player] = { settings = settings, conns = {}, ready = false }
+		for key, value in pairs(settings) do
+			player:SetAttribute("GM_" .. key, value) -- the menu reads these
+		end
+		player:SetAttribute("GM_CanTouchTools", canUseTouchTools(player)) -- menu shows the touch rows only if true
+		player:SetAttribute("GodMenuAllowed", true)
+	end
+
+	player.CharacterAdded:Connect(function(character)
+		onCharacterAdded(player, character)
+	end)
+
+	player.CharacterRemoving:Connect(function()
+		local st = states[player]
+		if st then
+			st.ready = false
+			dropAll(st)
+		end
+	end)
+
+	if player.Character then
+		task.spawn(onCharacterAdded, player, player.Character)
+	end
+end
+
+remote.OnServerEvent:Connect(function(player, key, value)
+	local st = states[player]
+	if not st then
+		return -- not an allowed player
+	end
+	if type(key) ~= "string" or DEFAULTS[key] == nil or type(value) ~= "boolean" then
+		return
+	end
+	if (key == "TouchFling" or key == "TouchKill") and not canUseTouchTools(player) then
+		return
+	end
+	if st.settings[key] == value then
+		return
+	end
+
+	st.settings[key] = value
+	player:SetAttribute("GM_" .. key, value)
+	apply(player, key, false)
+end)
+
+-- Admin touch tools -----------------------------------------------------------
+-- Server-side distance check (not Touched), so it works with collisions and CanTouch off.
+local lastHit = {} -- [victim Player] = os.clock() of the last hit
+
+local function launch(victimRoot, fromPosition)
+	local away = victimRoot.Position - fromPosition
+	local direction = Vector3.new(away.X, 0, away.Z)
+	if direction.Magnitude < 0.01 then
+		direction = victimRoot.CFrame.LookVector
+	end
+	direction = direction.Unit
+
+	-- A short-lived constraint replicates to the victim's client, which owns their physics
+	local attachment = Instance.new("Attachment")
+	attachment.Parent = victimRoot
+
+	local velocity = Instance.new("LinearVelocity")
+	velocity.Attachment0 = attachment
+	velocity.RelativeTo = Enum.ActuatorRelativeTo.World
+	velocity.MaxForce = math.huge
+	velocity.VectorVelocity = direction * CONFIG.FlingSpeed + Vector3.new(0, CONFIG.FlingLift, 0)
+	velocity.Parent = victimRoot
+
+	Debris:AddItem(velocity, 0.3)
+	Debris:AddItem(attachment, 0.3)
+end
+
+RunService.Heartbeat:Connect(function()
+	local now = os.clock()
+	for admin, st in pairs(states) do
+		local fling = st.settings.TouchFling
+		local kill = st.settings.TouchKill
+		local character = admin.Character
+		local adminRoot = character and character:FindFirstChild("HumanoidRootPart")
+
+		if st.ready and adminRoot and (fling or kill) and canUseTouchTools(admin) then
+			for _, victim in ipairs(Players:GetPlayers()) do
+				-- never hit yourself or the other admins in AllowedUserIds
+				if victim ~= admin and not table.find(CONFIG.AllowedUserIds, victim.UserId) then
+					local victimCharacter = victim.Character
+					local victimRoot = victimCharacter and victimCharacter:FindFirstChild("HumanoidRootPart")
+					local victimHumanoid = victimCharacter and victimCharacter:FindFirstChildOfClass("Humanoid")
+
+					if
+						victimRoot
+						and victimHumanoid
+						and victimHumanoid.Health > 0
+						and (victimRoot.Position - adminRoot.Position).Magnitude <= CONFIG.TouchRadius
+						and now - (lastHit[victim] or -1e9) >= CONFIG.TouchCooldown
+					then
+						lastHit[victim] = now
+						if kill then
+							victimHumanoid.Health = 0
+						end
+						if fling then
+							launch(victimRoot, adminRoot.Position)
+						end
+					end
+				end
+			end
+		end
+	end
+end)
+
+Players.PlayerAdded:Connect(onPlayerAdded)
+for _, player in ipairs(Players:GetPlayers()) do
+	task.spawn(onPlayerAdded, player)
+end
+
+Players.PlayerRemoving:Connect(function(player)
+	local st = states[player]
+	if st then
+		dropAll(st)
+	end
+	states[player] = nil
+	lastHit[player] = nil
+end)
